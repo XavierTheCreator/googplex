@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Googleplex</title>
+    <script>
+      // Set the theme before anything draws, from the copy lib/theme.js keeps
+      // (the real setting is in the app's database and is applied right after).
+      (function () {
+        var t = 'system'
+        try { t = localStorage.getItem('gp.theme') || 'system' } catch (e) {}
+        var dark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.classList.toggle('dark', dark)
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

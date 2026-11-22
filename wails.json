@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Googleplex",
+  "outputfilename": "googleplex",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Googleplex contributors"
+  },
+  "info": {
+    "companyName": "Googleplex",
+    "productName": "Googleplex",
+    "productVersion": "1.0.0",
+    "copyright": "Googleplex contributors",
+    "comments": "Your Google services in one window"
+  }
+}

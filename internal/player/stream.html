@@ -1,0 +1,250 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}video{display:block;width:100%;height:100%;background:#000}</style></head>
+<body>
+<video id="v" controls playsinline preload="auto"
+  data-src="{{.Src}}" data-fallback="{{.Fallback}}"
+  data-audio-src="{{.AudioSrc}}" data-audio-fallback="{{.AudioFallback}}"
+  data-vcodec="{{.VideoCodec}}" data-acodec="{{.AudioCodec}}"
+  data-video-index="{{.VideoIndex}}" data-audio-index="{{.AudioIndex}}"
+  data-start="{{.Start}}" data-autoplay="{{.Autoplay}}"></video>
+<script>
+// Plays a yt-dlp stream in one video element. It speaks the same postMessage
+// protocol as the YouTube player page (ready, playing, ended, error, time).
+//
+// When YouTube serves video and audio as separate files, both are fed into a
+// single element through Media Source Extensions, the way YouTube's own
+// player works: one clock, so audio can't drift or be paused separately.
+// Segments come through the app's proxy, using each file's sidx index for
+// byte ranges, about 45 s ahead of playback; data more than 30 s behind is
+// dropped to bound memory. Without Media Source support it falls back to a
+// video element plus a synced audio element.
+var v = document.getElementById("v"), d = v.dataset
+var start = Number(d.start) || 0
+var stalls = 0
+function report(msg){ parent.postMessage({source:"gp-player", msg:msg}, "*") }
+
+v.addEventListener("loadedmetadata", function(){
+  if (start > 0 && v.currentTime < 1) v.currentTime = start
+  report("ready")
+  if (d.autoplay === "true") v.play().catch(function(){})
+})
+v.addEventListener("playing", function(){ report("playing") })
+v.addEventListener("ended", function(){ report("ended") })
+v.addEventListener("waiting", function(){ stalls++ })
+setInterval(function(){ if (v.currentTime > 0) parent.postMessage({source:"gp-player", time: v.currentTime}, "*") }, 2000)
+
+// Commands from the app (keyboard shortcuts, timestamps in descriptions).
+window.addEventListener("message", function(e){
+  var c = e.data
+  if (e.source !== parent || !c || c.gp !== "cmd") return
+  if (c.cmd === "toggle") v.paused ? v.play().catch(function(){}) : v.pause()
+  if (c.cmd === "seekBy") v.currentTime = Math.max(0, v.currentTime + c.seconds)
+  if (c.cmd === "seekTo") { v.currentTime = Math.max(0, c.seconds); v.play().catch(function(){}) }
+})
+
+var MS = window.MediaSource || window.ManagedMediaSource
+var vType = 'video/mp4; codecs="' + d.vcodec + '"', aType = 'audio/mp4; codecs="' + d.acodec + '"'
+var canMSE = MS && d.audioSrc && d.vcodec && d.acodec && MS.isTypeSupported(vType) && MS.isTypeSupported(aType)
+
+if (canMSE) msePlayer()
+else if (d.audioSrc) twoElements()
+else singleFile()
+
+// ---- one file with both audio and video ----
+function singleFile(){
+  v.src = d.src
+  v.addEventListener("error", function(){
+    if (v.dataset.retried || !d.fallback) return report("error stream")
+    v.dataset.retried = "1"
+    start = v.currentTime || start
+    v.src = d.fallback
+  })
+}
+
+// ---- Media Source: video and audio in one element ----
+function msePlayer(){
+  window.__mode = "mse"
+  var ms = new MS()
+  if (window.ManagedMediaSource && MS === window.ManagedMediaSource) v.disableRemotePlayback = true
+  v.src = URL.createObjectURL(ms)
+  var tracks = []
+  var AHEAD = 45, BEHIND = 30
+
+  var json = function(url){ return fetch(url).then(function(r){ if (!r.ok) throw new Error(r.status); return r.json() }) }
+  var bytes = function(t, a, b, signal){
+    return fetch(t.url, {headers: {Range: "bytes=" + a + "-" + b}, signal: signal}).then(function(r){
+      if (!r.ok) throw new Error("segment " + r.status)
+      return r.arrayBuffer()
+    })
+  }
+  var whenIdle = function(sb){
+    return sb.updating ? new Promise(function(res){ sb.addEventListener("updateend", res, {once: true}) }) : Promise.resolve()
+  }
+  var append = function(sb, buf){
+    return whenIdle(sb).then(function(){
+      return new Promise(function(res, rej){
+        sb.addEventListener("updateend", res, {once: true})
+        sb.addEventListener("error", rej, {once: true})
+        sb.appendBuffer(buf)
+      })
+    })
+  }
+  var bufferedEnd = function(sb, t){
+    var b = sb.buffered
+    for (var i = 0; i < b.length; i++) if (b.start(i) <= t + 0.3 && b.end(i) > t) return b.end(i)
+    return t
+  }
+  var segmentAt = function(segs, t){
+    var lo = 0, hi = segs.length - 1
+    while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (segs[mid].time <= t) lo = mid; else hi = mid - 1 }
+    return lo
+  }
+  var evict = function(t){
+    var sb = t.sb, b = sb.buffered, cut = v.currentTime - BEHIND
+    if (!b.length || b.start(0) >= cut - 5) return Promise.resolve()
+    return whenIdle(sb).then(function(){ sb.remove(0, cut); return whenIdle(sb) })
+  }
+
+  // Fetch and append segments until AHEAD seconds are buffered past the playhead.
+  var pump = function(t){
+    if (t.busy) return
+    t.busy = true
+    var gen = t.gen
+    var step = function(){
+      if (gen !== t.gen) { t.busy = false; return pump(t) } // a seek restarted this track
+      if (bufferedEnd(t.sb, v.currentTime) - v.currentTime > AHEAD) { t.busy = false; return setTimeout(function(){ pump(t) }, 1000) }
+      if (t.next >= t.segs.length) { t.busy = false; t.done = true; return finish() }
+      var seg = t.segs[t.next]
+      t.ctrl = new AbortController()
+      bytes(t, seg.start, seg.end, t.ctrl.signal)
+        .then(function(buf){
+          if (gen !== t.gen) return
+          return evict(t).then(function(){ return append(t.sb, buf) }).catch(function(err){
+            if (err && err.name === "QuotaExceededError") { BEHIND = 10; return evict(t).then(function(){ return append(t.sb, buf) }) }
+            throw err
+          }).then(function(){ if (gen === t.gen) t.next++ })
+        })
+        .then(step, function(err){
+          t.busy = false
+          if (err && err.name === "AbortError") return pump(t)
+          t.fails = (t.fails || 0) + 1
+          if (t.fails < 4) return setTimeout(function(){ pump(t) }, 1000 * t.fails) // network hiccup: try again
+          report("error stream")
+        })
+    }
+    step()
+  }
+
+  var finish = function(){
+    if (!tracks.every(function(t){ return t.done }) || ms.readyState !== "open") return
+    Promise.all(tracks.map(function(t){ return whenIdle(t.sb) })).then(function(){
+      if (ms.readyState === "open" && tracks.every(function(t){ return t.done && !t.sb.updating })) ms.endOfStream()
+    })
+  }
+
+  // A seek: drop in-flight fetches and continue from the segment that holds the new time.
+  v.addEventListener("seeking", function(){
+    tracks.forEach(function(t){
+      var at = v.currentTime
+      var have = bufferedEnd(t.sb, at)
+      t.gen++
+      t.done = false
+      if (t.ctrl) t.ctrl.abort()
+      t.next = segmentAt(t.segs, have > at ? have : at)
+      if (have > at && t.segs[t.next] && t.segs[t.next].time < have - 0.5) t.next++
+      pump(t)
+    })
+  })
+
+  ms.addEventListener("sourceopen", function(){
+    if (tracks.length) return // reopened after endOfStream by a later append
+    Promise.all([json(d.videoIndex), json(d.audioIndex)]).then(function(ix){
+      var add = function(type, url, index){
+        return {sb: ms.addSourceBuffer(type), url: url, segs: index.segments, initEnd: index.initEnd, next: 0, gen: 0}
+      }
+      tracks = [add(vType, d.src, ix[0]), add(aType, d.audioSrc, ix[1])]
+      var last = function(s){ return s.length ? s[s.length - 1].time + s[s.length - 1].dur : 0 }
+      ms.duration = Math.max(last(ix[0].segments), last(ix[1].segments))
+      return Promise.all(tracks.map(function(t){
+        t.next = segmentAt(t.segs, start)
+        return bytes(t, 0, t.initEnd).then(function(buf){ return append(t.sb, buf) })
+      }))
+    }).then(function(){
+      tracks.forEach(pump)
+    }).catch(function(){
+      // No index or an unplayable init segment: use the two-element player.
+      window.__mode = "two-elements (MSE failed)"
+      URL.revokeObjectURL(v.src)
+      v.removeAttribute("src")
+      twoElements()
+    })
+  }, {once: false})
+}
+
+// ---- fallback: a video element plus a synced audio element ----
+//   - drift 0.05-0.5 s: nudge the audio's speed by 3% until it catches up
+//   - drift over 0.5 s: seek the audio, at most once every 3 seconds
+//   - a stall in either longer than 300 ms pauses the other until both have data
+function twoElements(){
+  window.__mode = window.__mode || "two-elements"
+  var a = document.createElement("audio")
+  a.preload = "auto"
+  document.body.appendChild(a)
+  var retry = function(el, fallback){
+    el.addEventListener("error", function(){
+      if (el.dataset.retried || !fallback) return report("error stream")
+      el.dataset.retried = "1"
+      start = v.currentTime || start
+      el.src = fallback
+      if (el === v) v.play().catch(function(){})
+    })
+  }
+  retry(v, d.fallback)
+  retry(a, d.audioFallback)
+  v.src = d.src
+  a.src = d.audioSrc
+
+  var rate = 1, lastSeek = 0, held = null, astalls = [], troubled = false
+  var ready = function(el){ return el.readyState >= 3 }
+  var setRate = function(r){ if (Math.abs(a.playbackRate - r) > 0.001) a.playbackRate = r }
+  var seekAudio = function(){ a.currentTime = v.currentTime; lastSeek = Date.now() }
+
+  v.addEventListener("play", function(){ if (!held) { seekAudio(); a.play().catch(function(){}) } })
+  v.addEventListener("pause", function(){ if (!held) a.pause() })
+  v.addEventListener("seeking", function(){ seekAudio() })
+  v.addEventListener("ratechange", function(){ rate = v.playbackRate; setRate(rate) })
+  v.addEventListener("volumechange", function(){ a.volume = v.volume; a.muted = v.muted })
+
+  var stall = function(el, other){
+    setTimeout(function(){
+      if (ready(el) || held || v.paused) return
+      held = el
+      if (other === v) v.pause(); else a.pause()
+    }, 300)
+  }
+  var resume = function(){
+    if (!held || !ready(v) || !ready(a)) return
+    held = null
+    if (Math.abs(v.currentTime - a.currentTime) > 0.5) seekAudio()
+    v.play().catch(function(){})
+    a.play().catch(function(){})
+  }
+  v.addEventListener("waiting", function(){ stall(v, a) })
+  a.addEventListener("waiting", function(){
+    stall(a, v)
+    var now = Date.now()
+    astalls = astalls.filter(function(t){ return now - t < 20000 }).concat(now)
+    if (astalls.length > 3 && !troubled) { troubled = true; report("audio_trouble") }
+  })
+  ;[v, a].forEach(function(el){ el.addEventListener("canplay", resume); el.addEventListener("playing", resume) })
+
+  setInterval(function(){
+    if (v.paused || a.paused || held) return
+    var dr = v.currentTime - a.currentTime
+    if (Math.abs(dr) > 0.5) { setRate(rate); if (Date.now() - lastSeek > 3000) seekAudio() }
+    else if (Math.abs(dr) > 0.05) setRate(rate * (dr > 0 ? 1.03 : 0.97))
+    else setRate(rate)
+  }, 250)
+}
+</script></body></html>
